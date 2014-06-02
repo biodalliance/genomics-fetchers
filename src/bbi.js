@@ -1,5 +1,13 @@
 "use strict";
 
+var spans = require('./spans');
+var Range = spans.Range;
+var union = spans.union;
+
+var jszlib = require('jszlib');
+var jszlib_inflate_buffer = jszlib.inflateBuffer;
+var arrayCopy = jszlib.arrayCopy;
+
 var M1 = 256;
 var M2 = 256*256;
 var M3 = 256*256*256;
@@ -16,6 +24,14 @@ var BIG_WIG_TYPE_FSTEP = 3;
 
 function bwg_readOffset(ba, o) {
     return ba[o] + ba[o+1]*M1 + ba[o+2]*M2 + ba[o+3]*M3 + ba[o+4]*M4;
+}
+
+function shallowCopy(o) {
+    var n = {};
+    for (var k in o) {
+        n[k] = o[k];
+    }
+    return n;
 }
 
 function connectBBI(f, opts) {
@@ -141,27 +157,30 @@ BBISource.prototype._readAutoSQL = function() {
     return this;
 }
 
+BBISource.prototype.getUnzoomedView = function() {
+    return new BBIView(this, this.unzoomedIndexOffset);
+}
 
-function BBIView(bbi) {
+function BBIView(bbi, cirTreeOffset) {
     this.bbi = bbi;
+    this.cirTreeOffset = cirTreeOffset;
 }
 
 BBIView.prototype.fetch = function(seqName, min, max) {
     var self = this;
-    var chr = this.bbi.chromsToIDs[chrName];
+    var chr = this.bbi.chromsToIDs[seqName];
     if (chr === undefined) {
         // Not an error because some files won't have data for all chromosomes.
         return Promise.resolve([]);
     } else {
-        return self.cirLookup(chr, min, max)
-          .then(function(blocks))
+        return self.readWigDataById(chr, min, max);
     }
 }
 
 BBIView.prototype.readWigDataById = function(chr, min, max) {
     var thisB = this;
     if (!this.cirHeader) {
-        return this.bwg.data.slice(this.cirTreeOffset, 48).fetch()
+        return this.bbi.data.slice(this.cirTreeOffset, 48).fetch()
           .then(function(result) {
             thisB.cirHeader = result;
             var la = new Int32Array(thisB.cirHeader);
@@ -207,7 +226,7 @@ BBIView.prototype.readWigDataById = function(chr, min, max) {
 
         var cirFobStartFetch = function(offset, fr, level, attempts) {
             var length = fr.max() - fr.min();
-            thisB.bwg.data.slice(fr.min(), fr.max() - fr.min()).fetch().
+            thisB.bbi.data.slice(fr.min(), fr.max() - fr.min()).fetch().
               then(function(resultBuffer) {
                 for (var i = 0; i < offset.length; ++i) {
                     if (fr.contains(offset[i])) {
@@ -277,10 +296,10 @@ BBIView.prototype.readWigDataById = function(chr, min, max) {
 }
 
 
-BBIView.prototype.createFeature(chr, fmin, fmax, opts) {
+BBIView.prototype.createFeature = function(chr, fmin, fmax, opts) {
     var f = {
         _chromId: chr,
-        seqName: this.bwg.idsToChroms[chr],
+        seqName: this.bbi.idsToChroms[chr],
         min: fmin,
         max: fmax
     };
@@ -302,15 +321,18 @@ BBIView.prototype.fetchFeatures = function(filter, blocks) {
     
     var blocksToFetch = [];
     if (blocks.length > 0) {
-        var current = blocks[0];
+        var current = shallowCopy(blocks[0]);
+        current.offsets = [current.offset];
         for (var bi = 1; bi < blocks.length; ++bi) {
             var b = blocks[bi];
             if (b.offset <= (current.offset + current.size)) {
                 current.size = b.offset + b.size - current.offset;
-                current.maxOffset = b.offset;
+                current.offsets.push(b.offset);
+
             } else {
                 blocksToFetch.push(current);
-                current = b;
+                current = shallowCopy(b);
+                current.offsets = [current.offset];
             }
         }
         blocksToFetch.push(current);
@@ -322,38 +344,36 @@ BBIView.prototype.fetchFeatures = function(filter, blocks) {
             return Promise.resolve(features);
         } else {
             var block = blocksToFetch[bi];
-            return thisB.bwg.data.slice(block.offset, block.size).fetch
-              .then(function(result) {
-                var maxOffset = 0;
-                if (block.maxOffset)
-                    maxOffset = block.maxOffset - block.offset;
-                var offset = 0;
-                var ptr = [0];
-                while (offset <= maxOffset) {
-                    if (thisB.bwg.uncompressBufSize > 0) {
-                        var data = jszlib_inflate_buffer(result, offset + 2, ptr);
-                        thisB.parseFeatures(data, 0, filter, features);
-                        offset = ptr[0];
+            return thisB.bbi.data.slice(block.offset, block.size).fetch()
+              .then(function(result) {     
+                for (var oi = 0; oi < block.offsets.length; ++oi) {
+                    if (thisB.bbi.uncompressBufSize > 0) {
+                        var data = jszlib_inflate_buffer(result, block.offsets[oi] - block.offset + 2);
+                        thisB.parseFeatures(data, 0, data.byteLength, filter, features);
                     } else {
-                        offset += thisB.parseFeatures(result, offset, filter, features);
+                        thisB.parseFeatures(
+                            result, 
+                            block.offsets[oi] - block.offset,
+                            oi < block.offsets.length - 1 ? block.offsets[oi + 1] - block.offset : result.byteLength,
+                            block.filter, 
+                            features);
                     }
                 }
                 return tramp(bi + 1);
               });
         }
-    }
+    };
     return tramp(0);
 }
 
-BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
+BBIView.prototype.parseFeatures = function(data, offset, limit, filter, features) {
     var ba = new Uint8Array(data, offset);
 
     if (this.isSummary) {
-        var sa = new Int16Array(data, offset, ((data.byteLength - offset) / 2) | 0);
-        var la = new Int32Array(data, offset, ((data.byteLength - offset) / 4) | 0);
-        var fa = new Float32Array(data, offset, ((data.byteLength - offset) / 4) | 0);
+        var sa = new Int16Array(data, offset, ((limit - offset) / 2) | 0);
+        var la = new Int32Array(data, offset, ((limit - offset) / 4) | 0);
+        var fa = new Float32Array(data, offset, ((limit - offset) / 4) | 0);
 
-        // Think this is okay because summaries only occur in compressed files...
         var itemCount = data.byteLength/32;
         for (var i = 0; i < itemCount; ++i) {
             var chromId =   la[(i*8)];
@@ -367,17 +387,16 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
             
             if (filter(chromId, start + 1, end)) {
                 var summaryOpts = {type: 'bigwig', score: sumData/validCnt, maxScore: maxVal};
-                if (this.bwg.type == 'bigbed') {
+                if (this.bbi.type == 'bigbed') {
                     summaryOpts.type = 'density';
                 }
                 features.push(this.createFeature(chromId, start + 1, end, summaryOpts));
             }
         }
-        return itemCount * 32;
-    } else if (this.bwg.type == 'bigwig') {
-        var sa = new Int16Array(data, offset, ((data.byteLength - offset) / 2) | 0);
-        var la = new Int32Array(data, offset, ((data.byteLength - offset) / 4) | 0);
-        var fa = new Float32Array(data, offset, ((data.byteLength - offset) / 4) | 0);
+    } else if (this.bbi.type == 'bigwig') {
+        var sa = new Int16Array(data, offset, ((limit - offset) / 2) | 0);
+        var la = new Int32Array(data, offset, ((limit - offset) / 4) | 0);
+        var fa = new Float32Array(data, offset, ((limit - offset) / 4) | 0);
 
         var chromId = la[0];
         var blockStart = la[1];
@@ -415,14 +434,15 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
                 if (filter(chromId, start, end))
                     features.push(this.createFeature(chromId, start, end, {score: score}));
             }
-            return 24 + (itemCount * 12);
         } else {
             throw Error('Currently not handling bwgType=' + blockType);
         }
-    } else if (this.bwg.type == 'bigbed') {
-        var offset = 0;
-        var dfc = this.bwg.definedFieldCount;
-        var schema = this.bwg.schema;
+    } else if (this.bbi.type == 'bigbed') {
+        limit -= offset;
+        offset = 0;
+
+        var dfc = this.bbi.definedFieldCount;
+        var schema = this.bbi.schema;
 
         while (offset < ba.length) {
             var chromId = (ba[offset+3]<<24) | (ba[offset+2]<<16) | (ba[offset+1]<<8) | (ba[offset+0]);
@@ -473,7 +493,7 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
 
             if (filter(chromId, start + 1, end, bedColumns)) {
                 if (dfc < 12) {
-                    createFeature(chromId, start + 1, end, featureOpts);
+                    features.push(this.createFeature(chromId, start + 1, end, featureOpts));
                 } else {
                     var thickStart = bedColumns[3]|0;
                     var thickEnd   = bedColumns[4]|0;
@@ -481,13 +501,13 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
                     var blockSizes = bedColumns[7].split(',');
                     var blockStarts = bedColumns[8].split(',');
                     
-                    featureOpts.type = 'transcript'
-                    var grp = new DASGroup();
+                    featureOpts.type = 'transcript';
+                    var grp = {};
                     for (var k in featureOpts) {
                         grp[k] = featureOpts[k];
                     }
                     grp.id = bedColumns[0];
-                    grp.segment = this.bwg.idsToChroms[chromId];
+                    grp.segment = this.bbi.idsToChroms[chromId];
                     grp.min = start + 1;
                     grp.max = end;
                     grp.notes = [];
@@ -518,7 +538,7 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
                     var tsList = spans.ranges();
                     for (var s = 0; s < tsList.length; ++s) {
                         var ts = tsList[s];
-                        createFeature(chromId, ts.min() + 1, ts.max(), featureOpts);
+                        features.push(this.createFeature(chromId, ts.min() + 1, ts.max(), featureOpts));
                     }
 
                     if (thickEnd > thickStart) {
@@ -528,7 +548,7 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
                             var tlList = tl.ranges();
                             for (var s = 0; s < tlList.length; ++s) {
                                 var ts = tlList[s];
-                                createFeature(chromId, ts.min() + 1, ts.max(), featureOpts);
+                                features.push(this.createFeature(chromId, ts.min() + 1, ts.max(), featureOpts));
                             }
                         }
                     }
@@ -536,7 +556,7 @@ BBIView.prototype.parseFeatures = function(data, offset, filter, features) {
             }
         }
     } else {
-        dlog("Don't know what to do with " + this.bwg.type);
+        throw Error("Don't know what to do with " + this.bbi.type);
     }
 }
 
