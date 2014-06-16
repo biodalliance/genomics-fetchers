@@ -1,6 +1,6 @@
 {
   "name": "genomics-fetchers",
-  "version:": "0.0.1",
+  "version": "0.1.0",
   "description": "Common back-ends for Javascript genomics tools.",
   "homepage": "https://www.biodalliance.org/",
   "repository": {
@@ -8,8 +8,8 @@
     "url": "git@github.com:biodalliance/genomics-fetchers.git"
   },
   "dependencies": {
-    "jszlib": "dasmoth/jszlib",
-    "es6-promise": "~0.1.2"
+    "es6-promise": "~0.1.2",
+    "jszlib": "dasmoth/jszlib"
   },
   "devDependencies": {
     "gulp-concat": "~2.2.0",
