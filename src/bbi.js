@@ -4,6 +4,8 @@ var spans = require('./spans');
 var Range = spans.Range;
 var union = spans.union;
 
+var bin = require('./binutils');
+
 var jszlib = require('jszlib');
 var jszlib_inflate_buffer = jszlib.inflateBuffer;
 var arrayCopy = jszlib.arrayCopy;
@@ -561,5 +563,6 @@ BBIView.prototype.parseFeatures = function(data, offset, limit, filter, features
 }
 
 module.exports = {
-    connectBBI: connectBBI
+    connectBBI: connectBBI,
+    URLFetchable: bin.URLFetchable
 }
